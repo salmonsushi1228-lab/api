@@ -41,11 +41,11 @@ def get_valorant_store(data: LoginRequest):
     }
 
     try:
-        # 1. 초기 인증 세션 쿠키 생성
+        # 1. Auth 세션 쿠키 초기화
         init_res = session.post("https://auth.riotgames.com/api/v1/authorization", json=auth_body, timeout=10)
         init_res.raise_for_status()
 
-        # 2. 아이디/비밀번호 인증 요청
+        # 2. 로그인 시도
         login_body = {
             "type": "auth",
             "username": data.username,
@@ -56,8 +56,10 @@ def get_valorant_store(data: LoginRequest):
         login_res = session.put("https://auth.riotgames.com/api/v1/authorization", json=login_body, timeout=10)
         login_json = login_res.json()
 
-        # 인증 에러 응답 처리
-        if login_json.get("type") == "error":
+        # 에러 응답 분기 처리
+        response_type = login_json.get("type")
+        
+        if response_type == "error":
             err = login_json.get("error")
             if err == "auth_failure":
                 raise HTTPException(status_code=400, detail="아이디 또는 비밀번호가 올바르지 않습니다.")
@@ -66,20 +68,24 @@ def get_valorant_store(data: LoginRequest):
             else:
                 raise HTTPException(status_code=400, detail=f"로그인 오류: {err}")
 
-        if login_json.get("type") == "multifactor":
-            raise HTTPException(status_code=400, detail="2단계 인증(MFA)이 설정되어 있어 접속할 수 없습니다. 2단계 인증을 해제 후 시도해 주세요.")
+        if response_type == "multifactor":
+            raise HTTPException(status_code=400, detail="2단계 인증(MFA)이 설정되어 있어 접속할 수 없습니다. 계정 설정에서 2단계 인증을 해제해 주세요.")
 
-        # 3. 토큰 추출 및 예외 방지
-        response_data = login_json.get("response", {})
-        parameters = response_data.get("parameters", {})
-        uri = parameters.get("uri", "")
+        if response_type == "captcha":
+            raise HTTPException(status_code=400, detail="라이엇 보안 캡차(Captcha)가 동작 중입니다. 웹 브라우저에서 라이엇 공식 사이트에 로그인하여 캡차를 해제 후 시도하세요.")
+
+        # 3. URI 및 토큰 추출
+        uri = login_json.get("response", {}).get("parameters", {}).get("uri", "")
 
         if not uri:
-            raise HTTPException(status_code=400, detail="인증 URI를 가져오지 못했습니다. 계정 정보를 확인해 주세요.")
+            raise HTTPException(
+                status_code=400, 
+                detail=f"인증 응답 형식이 올바르지 않습니다. (응답 타입: {response_type})"
+            )
 
         access_token_match = re.search(r'access_token=([^&]+)', uri)
         if not access_token_match:
-            raise HTTPException(status_code=400, detail="액세스 토큰 파싱 실패")
+            raise HTTPException(status_code=400, detail="액세스 토큰 파싱에 실패했습니다.")
         access_token = access_token_match.group(1)
 
         # 4. Entitlements Token 발급
@@ -99,9 +105,9 @@ def get_valorant_store(data: LoginRequest):
         puuid = user_res.json().get("sub")
 
         if not entitlements_token or not puuid:
-            raise HTTPException(status_code=400, detail="사용자 정보 또는 토큰 발급에 실패했습니다.")
+            raise HTTPException(status_code=400, detail="사용자 토큰 또는 PUUID 정보 취득 실패")
 
-        # 6. 상점 정보 수집
+        # 6. 상점 데이터 수집
         region_host = "pd.kr" if data.region == "kr" else f"pd.{data.region}"
         store_res = session.get(
             f"https://{region_host}.a.pvp.net/store/v2/storefront/{puuid}",
@@ -156,4 +162,4 @@ def get_valorant_store(data: LoginRequest):
     except HTTPException as he:
         raise he
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"서버 내부 오류: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"서버 처리 오류: {str(e)}")
