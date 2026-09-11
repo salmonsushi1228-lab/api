@@ -51,6 +51,16 @@ def get_valorant_store(data: StoreRequest):
     client_platform = "ew0KCSJwbGF0Zm9ybVR5cGUiOiAiUEMiLA0KCSJwbGF0Zm9ybU9TIjogIldpbmRvd3MiLA0KCSJwbGF0Zm9ybU9TVmVyc2lvbiI6ICIxMC4wLjE5MDQ1LjEuMjU2LjY0Yml0IiwNCgkicGxhdGZvcm1DaGlwc2V0IjogIlVua25vd24iDQp9"
     user_agent = "RiotClient/93.0.1.2132.4019 rso-auth (Windows;10;10.0.19045.1.256.64bit)"
 
+    # 라이엇 실제 API 도메인 매핑 (LATAM/BR -> pd.na)
+    region_map = {
+        "kr": "pd.kr",
+        "ap": "pd.ap",
+        "na": "pd.na",
+        "eu": "pd.eu",
+        "latam": "pd.na",
+        "br": "pd.na"
+    }
+
     with requests.Session() as session:
         try:
             # 1. 최신 발로란트 클라이언트 버전 파싱
@@ -94,7 +104,7 @@ def get_valorant_store(data: StoreRequest):
             if not puuid:
                 raise HTTPException(status_code=400, detail="사용자 PUUID 추출 실패")
 
-            # 4. 계정 서버 지역(PAS Shard) 조회
+            # 4. 계정 서버 지역(PAS Shard) 자동 감지
             detected_shard = None
             try:
                 pas_res = session.put(
@@ -111,19 +121,24 @@ def get_valorant_store(data: StoreRequest):
             except Exception:
                 pass
 
-            # 탐색할 지역 목록 정리
-            regions_to_try = []
+            # 탐색할 후보 지역 매핑 목록 정리
+            raw_regions = []
             if detected_shard:
-                regions_to_try.append(detected_shard.lower())
-            regions_to_try.extend([data.region.lower(), "kr", "ap", "na", "eu", "latam", "br"])
-            regions_to_try = list(dict.fromkeys(regions_to_try))
+                raw_regions.append(detected_shard.lower())
+            raw_regions.extend([data.region.lower(), "kr", "ap", "na", "eu"])
+            
+            # 중복 제거 및 호스트 변환
+            host_candidates = []
+            for r in raw_regions:
+                host = region_map.get(r, f"pd.{r}")
+                if host not in host_candidates:
+                    host_candidates.append(host)
 
             store_data = None
             last_status = 404
 
             # 5. 상점 엔드포인트 순차 조회
-            for reg in regions_to_try:
-                region_host = f"pd.{reg}"
+            for region_host in host_candidates:
                 store_headers = {
                     "Authorization": f"Bearer {access_token}",
                     "X-Riot-Entitlements-JWT": entitlements_token,
@@ -132,22 +147,25 @@ def get_valorant_store(data: StoreRequest):
                     "User-Agent": user_agent
                 }
 
-                store_res = session.get(
-                    f"https://{region_host}.a.pvp.net/store/v2/storefront/{puuid}",
-                    headers=store_headers,
-                    timeout=10.0
-                )
+                try:
+                    store_res = session.get(
+                        f"https://{region_host}.a.pvp.net/store/v2/storefront/{puuid}",
+                        headers=store_headers,
+                        timeout=10.0
+                    )
 
-                if store_res.status_code == 200:
-                    store_data = store_res.json()
-                    break
-                else:
-                    last_status = store_res.status_code
+                    if store_res.status_code == 200:
+                        store_data = store_res.json()
+                        break
+                    else:
+                        last_status = store_res.status_code
+                except Exception:
+                    continue
 
             if not store_data:
                 raise HTTPException(
                     status_code=last_status,
-                    detail="발로란트 계정 정보를 찾을 수 없습니다. 해당 계정으로 발로란트 게임에 최소 1회 접속한 적이 있는지 확인해 주세요."
+                    detail="발로란트 계정 정보를 찾을 수 없습니다. 해당 라이엇 계정으로 PC 발로란트에 최소 1회 접속한 적이 있는지 확인해 주세요."
                 )
 
             # 6. 스킨 정보 순차 파싱
