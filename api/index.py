@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import requests
+from concurrent.futures import ThreadPoolExecutor
 
 app = FastAPI()
 
@@ -15,6 +16,7 @@ app.add_middleware(
 
 class StoreRequest(BaseModel):
     access_token: str
+    id_token: str = None  # PAS 서버 지역 감지용 ID 토큰 (선택)
     region: str = "kr"
 
 @app.get("/")
@@ -23,10 +25,11 @@ class StoreRequest(BaseModel):
 def check_status():
     return {"status": "ok", "message": "Valorant Store API is running"}
 
-def fetch_skin_info(session: requests.Session, item_id: str, discount: int = 0):
+def fetch_skin_info(item_id: str, discount: int = 0):
+    """단일 스킨 정보를 가져오는 독립 함수 (스레드 풀용)"""
     try:
         url = f"https://valorant-api.com/v1/weapons/skinlevel/{item_id}?language=ko-KR"
-        res = session.get(url, timeout=5.0)
+        res = requests.get(url, timeout=5.0)
         if res.status_code == 200:
             data_obj = res.json().get("data", {})
             skin_data = {
@@ -104,8 +107,9 @@ def get_valorant_store(data: StoreRequest):
             if not puuid:
                 raise HTTPException(status_code=400, detail="사용자 PUUID 추출 실패")
 
-            # 4. 계정 서버 지역(PAS Shard) 자동 감지
+            # 4. 계정 서버 지역(PAS Shard) 감지 시도 (id_token 사용)
             detected_shard = None
+            token_for_pas = data.id_token.strip() if data.id_token else access_token
             try:
                 pas_res = session.put(
                     "https://riot-geo.pas.games.riotgames.com/pas/v1/product/valorant",
@@ -113,7 +117,7 @@ def get_valorant_store(data: StoreRequest):
                         "Authorization": f"Bearer {access_token}",
                         "Content-Type": "application/json"
                     },
-                    json={"id_token": access_token},
+                    json={"id_token": token_for_pas},
                     timeout=5.0
                 )
                 if pas_res.status_code == 200:
@@ -121,7 +125,7 @@ def get_valorant_store(data: StoreRequest):
             except Exception:
                 pass
 
-            # 탐색할 후보 지역 매핑 목록 정리
+            # 탐색할 후보 지역 정리
             raw_regions = []
             if detected_shard:
                 raw_regions.append(detected_shard.lower())
@@ -168,23 +172,34 @@ def get_valorant_store(data: StoreRequest):
                     detail="발로란트 계정 정보를 찾을 수 없습니다. 해당 라이엇 계정으로 PC 발로란트에 최소 1회 접속한 적이 있는지 확인해 주세요."
                 )
 
-            # 6. 스킨 정보 순차 파싱
+            # 6. 스킨 정보 병렬 파싱 (ThreadPoolExecutor 활용)
             daily_item_ids = store_data.get("SkinsPanelLayout", {}).get("SingleItemOffers", [])
             bonus_store = store_data.get("BonusStore", {}).get("BonusStoreOffers", [])
 
             daily_skins = []
-            for item_id in daily_item_ids:
-                skin_info = fetch_skin_info(session, item_id)
-                if skin_info:
-                    daily_skins.append(skin_info)
-
             night_skins = []
-            for offer in bonus_store:
-                item_id = offer.get("Offer", {}).get("OfferID")
-                discount = offer.get("DiscountPercent", 0)
-                skin_info = fetch_skin_info(session, item_id, discount)
-                if skin_info:
-                    night_skins.append(skin_info)
+
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                # 일일 상점 병렬 요청
+                daily_futures = [executor.submit(fetch_skin_info, item_id) for item_id in daily_item_ids]
+                for future in daily_futures:
+                    res = future.result()
+                    if res:
+                        daily_skins.append(res)
+
+                # 야시장 병렬 요청
+                night_futures = [
+                    executor.submit(
+                        fetch_skin_info,
+                        offer.get("Offer", {}).get("OfferID"),
+                        offer.get("DiscountPercent", 0)
+                    )
+                    for offer in bonus_store
+                ]
+                for future in night_futures:
+                    res = future.result()
+                    if res:
+                        night_skins.append(res)
 
             return {
                 "success": True,
