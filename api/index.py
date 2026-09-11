@@ -8,7 +8,7 @@ import re
 
 app = FastAPI()
 
-# CORS 설정: 프론트엔드 통신 허용
+# CORS 설정
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,14 +22,14 @@ class LoginRequest(BaseModel):
     password: str
     region: str = "kr"
 
-# 헬스체크 및 백엔드 상태 확인 (Vercel Rewrites 대응: /, /store, /api/store 모두 등록)
+# 헬스체크 (Vercel Rewrites 대응: /, /store, /api/store)
 @app.get("/")
 @app.get("/store")
 @app.get("/api/store")
 async def check_status():
     return {"status": "ok", "message": "Valorant Store API is running"}
 
-# 단일 스킨 정보 비동기 파싱 함수 (병렬 처리용)
+# 단일 스킨 정보 비동기 파싱
 async def fetch_skin_info(client: httpx.AsyncClient, item_id: str, discount: int = 0):
     try:
         url = f"https://valorant-api.com/v1/weapons/skinlevel/{item_id}?language=ko-KR"
@@ -47,23 +47,25 @@ async def fetch_skin_info(client: httpx.AsyncClient, item_id: str, discount: int
         pass
     return None
 
-# 상점 데이터 조회 POST 엔드포인트
 @app.post("/")
 @app.post("/store")
 @app.post("/api/store")
 async def get_valorant_store(data: LoginRequest):
-    # httpx AsyncClient를 통한 비동기 세션 구성 (쿠키 자동 유지)
-    async with httpx.AsyncClient(follow_redirects=True) as client:
+    # 최신 Riot Client 헤더 및 Client-Platform 명세
+    client_platform = "ew0KCSJwbGF0Zm9ybVR5cGUiOiAiUEMiLA0KCSJwbGF0Zm9ybU9TIjogIldpbmRvd3MiLA0KCSJwbGF0Zm9ybU9TVmVyc2lvbiI6ICIxMC4wLjE5MDQ1LjEuMjU2LjY0Yml0IiwNCgkicGxhdGZvcm1DaGlwc2V0IjogIlVua25vd24iDQp9"
+    user_agent = "RiotClient/93.0.1.2132.4019 rso-auth (Windows;10;10.0.19045.1.256.64bit)"
+
+    async with httpx.AsyncClient(follow_redirects=True, cookies=httpx.Cookies()) as client:
         headers = {
-            'User-Agent': 'RiotClient/84.0.1.1328.3242 rso-auth (Windows;10;10.0.19045.1.256.64bit)',
-            'Content-Type': 'application/json; charset=utf-8',
+            'User-Agent': user_agent,
+            'Content-Type': 'application/json',
             'Accept': 'application/json, text/plain, */*',
-            'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache'
+            'X-Riot-ClientPlatform': client_platform,
+            'X-Riot-ClientVersion': 'release-09.03-shipping-9-2708302'
         }
         client.headers.update(headers)
 
-        # 1. Auth 세션 초기화
+        # 1. Auth 세션 초기화 (POST)
         auth_body = {
             "client_id": "play-valorant-web-prod",
             "nonce": "1",
@@ -75,12 +77,12 @@ async def get_valorant_store(data: LoginRequest):
         try:
             init_res = await client.post(
                 "https://auth.riotgames.com/api/v1/authorization",
-                content=json.dumps(auth_body, ensure_ascii=False),
+                json=auth_body,
                 timeout=10.0
             )
             init_res.raise_for_status()
 
-            # 2. 로그인 자격 증명 전송
+            # 2. 자격 증명 전송 (PUT)
             login_body = {
                 "type": "auth",
                 "username": data.username.strip(),
@@ -90,7 +92,7 @@ async def get_valorant_store(data: LoginRequest):
 
             login_res = await client.put(
                 "https://auth.riotgames.com/api/v1/authorization",
-                content=json.dumps(login_body, ensure_ascii=False),
+                json=login_body,
                 timeout=10.0
             )
             login_res.raise_for_status()
@@ -98,13 +100,13 @@ async def get_valorant_store(data: LoginRequest):
 
             response_type = login_json.get("type")
 
-            # 오류 응답 세부 분기
+            # 오류 및 인증 예외 분기
             if response_type == "error":
                 err = login_json.get("error")
                 if err == "auth_failure":
                     raise HTTPException(
                         status_code=400,
-                        detail="아이디 또는 비밀번호가 올바르지 않습니다. (Riot ID가 아닌 '로그인용 계정명'인지 확인해 주세요.)"
+                        detail="아이디 또는 비밀번호가 올바르지 않습니다. (Riot ID 태그가 아닌 '로그인용 계정명'을 입력했는지 확인해 주세요.)"
                     )
                 elif err == "rate_limited":
                     raise HTTPException(
@@ -132,9 +134,10 @@ async def get_valorant_store(data: LoginRequest):
             uri = parameters.get("uri", "")
 
             if not uri:
+                # 응답 구조 디버깅용 메시지
                 raise HTTPException(
                     status_code=400,
-                    detail="인증 URI를 가져오지 못했습니다. 계정 정보를 확인해 주세요."
+                    detail=f"인증 URI를 취득하지 못했습니다. (라이엇 응답 유형: {response_type})"
                 )
 
             access_token_match = re.search(r'access_token=([^&]+)', uri)
@@ -146,6 +149,7 @@ async def get_valorant_store(data: LoginRequest):
             ent_res = await client.post(
                 "https://entitlements.auth.riotgames.com/api/token/v1",
                 headers={"Authorization": f"Bearer {access_token}"},
+                json={},
                 timeout=10.0
             )
             ent_res.raise_for_status()
@@ -176,7 +180,8 @@ async def get_valorant_store(data: LoginRequest):
                 f"https://{region_host}.a.pvp.net/store/v2/storefront/{puuid}",
                 headers={
                     "Authorization": f"Bearer {access_token}",
-                    "X-Riot-Entitlements-JWT": entitlements_token
+                    "X-Riot-Entitlements-JWT": entitlements_token,
+                    "X-Riot-ClientPlatform": client_platform
                 },
                 timeout=10.0
             )
@@ -187,7 +192,6 @@ async def get_valorant_store(data: LoginRequest):
             daily_item_ids = store_data.get("SkinsPanelLayout", {}).get("SingleItemOffers", [])
             bonus_store = store_data.get("BonusStore", {}).get("BonusStoreOffers", [])
 
-            # 태스크 생성
             daily_tasks = [fetch_skin_info(client, item_id) for item_id in daily_item_ids]
             night_tasks = [
                 fetch_skin_info(
@@ -198,11 +202,9 @@ async def get_valorant_store(data: LoginRequest):
                 for offer in bonus_store
             ]
 
-            # 병렬 실행
             daily_results = await asyncio.gather(*daily_tasks)
             night_results = await asyncio.gather(*night_tasks)
 
-            # None 값 제외
             daily_skins = [s for s in daily_results if s is not None]
             night_skins = [s for s in night_results if s is not None]
 
