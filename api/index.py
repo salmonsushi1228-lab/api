@@ -2,7 +2,6 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import requests
-import re
 
 app = FastAPI()
 
@@ -14,107 +13,69 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 👈 테스트용 (브라우저에서 직접 접속했을 때 404가 아닌 메시지가 떠야 정상 작동함)
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+    region: str = "kr"
+
 @app.get("/api/store")
 def check_status():
     return {"status": "ok", "message": "Valorant Store API is running"}
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-    region: str = "kr"
-
-# ... (기존 @app.post("/api/store") 코드 그대로 유지)
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-    region: str = "kr"
-
-USER_AGENT = "RiotClient/43.0.1.4195386.4190634 rso-auth (Windows;10;10.0.19042.1.256.64bit)"
 
 @app.post("/api/store")
 def get_valorant_store(data: LoginRequest):
     session = requests.Session()
     session.headers.update({
-        "User-Agent": USER_AGENT,
-        "Content-Type": "application/json"
+        'User-Agent': 'RiotClient/63.0.9.4909983.4789131 rso-auth (Windows;10;10.0.19045.1.256.64bit)',
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, text/plain, */*'
     })
 
+    # 1. Cookies 및 Auth 토큰 초기화 요청
+    auth_body = {
+        "client_id": "play-valorant-web-prod",
+        "nonce": "1",
+        "redirect_uri": "https://playvalorant.com/opt_in",
+        "response_type": "token id_token",
+        "scope": "account openid"
+    }
+    
     try:
-        # Step 1: Auth 세션 및 쿠키 생성
-        auth_payload = {
-            "client_id": "play-valorant-web-prod",
-            "nonce": "1",
-            "redirect_uri": "https://playvalorant.com/opt_in",
-            "response_type": "token id_token"
-        }
-        session.post("https://auth.riotgames.com/api/v1/authorization", json=auth_payload, timeout=10)
+        init_res = session.post("https://auth.riotgames.com/api/v1/authorization", json=auth_body)
+        init_res.raise_for_status()
 
-        # Step 2: ID/PW 로그인
-        login_payload = {
+        # 2. 자격 증명(ID/PW) 전송
+        login_body = {
             "type": "auth",
             "username": data.username,
-            "password": data.password
+            "password": data.password,
+            "remember": "true"
         }
-        login_res = session.put("https://auth.riotgames.com/api/v1/authorization", json=login_payload, timeout=10).json()
-
-        if "error" in login_res:
-            raise HTTPException(status_code=401, detail="로그인 실패: 아이디 또는 비밀번호를 확인하세요.")
-
-        # Access Token 추출
-        pattern = re.compile(r'access_token=([^&]+)')
-        uri = login_res.get("response", {}).get("parameters", {}).get("uri", "")
-        match = pattern.search(uri)
-        if not match:
-            raise HTTPException(status_code=401, detail="2단계 인증이 설정되어 있거나 인증 토큰을 추출할 수 없습니다.")
         
-        access_token = match.group(1)
+        login_res = session.put("https://auth.riotgames.com/api/v1/authorization", json=login_body)
+        login_json = login_res.json()
 
-        # Step 3: Entitlements Token 발급
-        ent_headers = {"Authorization": f"Bearer {access_token}"}
-        ent_res = session.post("https://entitlements.auth.riotgames.com/api/token/v1", headers=ent_headers, json={}, timeout=10).json()
-        entitlements_token = ent_res.get("entitlements_token")
+        # 오류 처리
+        if login_json.get("type") == "error":
+            error_code = login_json.get("error")
+            if error_code == "auth_failure":
+                raise HTTPException(status_code=400, detail="아이디 또는 비밀번호가 올바르지 않습니다.")
+            elif error_code == "rate_limited":
+                raise HTTPException(status_code=429, detail="시도 횟수가 너무 많습니다. 잠시 후 다시 시도해주세요.")
+            else:
+                raise HTTPException(status_code=400, detail=f"로그인 오류: {error_code}")
 
-        # Step 4: PUUID (사용자 고유 ID) 조회
-        user_info = session.get("https://auth.riotgames.com/userinfo", headers=ent_headers, timeout=10).json()
-        puuid = user_info.get("sub")
+        # 2단계 인증 요구 시
+        if login_json.get("type") == "multifactor":
+            raise HTTPException(status_code=400, detail="계정에 2단계 인증(MFA)이 설정되어 있어 접속할 수 없습니다. 2단계 인증을 해제 후 시도해 주세요.")
 
-        # Step 5: 실제 상점 데이터(일일상점 + 야시장) 조회
-        store_headers = {
-            "Authorization": f"Bearer {access_token}",
-            "X-Riot-Entitlements-JWT": entitlements_token
-        }
-        store_url = f"https://pd.{data.region}.a.pvp.net/store/v2/storefront/{puuid}"
-        store_data = session.get(store_url, headers=store_headers, timeout=10).json()
+        # 3. 액세스 토큰 추출
+        if "response" in login_json and "parameters" in login_json["response"]:
+            uri = login_json["response"]["parameters"]["uri"]
+            # URI 해석 로직 진행...
+            return {"success": True, "message": "로그인 성공!"}
+        else:
+            raise HTTPException(status_code=400, detail="인증 토큰을 취득하지 못했습니다.")
 
-        # 스킨 정보 한글 매핑을 위해 Valorant-API 조회
-        skin_db_res = requests.get("https://valorant-api.com/v1/weapons/skinlevels?language=ko-KR", timeout=10).json()
-        skin_db = {item["uuid"].lower(): {"name": item["displayName"], "icon": item["displayIcon"]} for item in skin_db_res.get("data", [])}
-
-        # 일일상점 스킨 ID -> 이름/이미지 변환
-        daily_offers = store_data.get("SkinsPanelLayout", {}).get("SingleItemOffers", [])
-        daily_skins = [skin_db.get(offer_id.lower(), {"name": "알 수 없는 스킨", "icon": ""}) for offer_id in daily_offers]
-
-        # 야시장 데이터 변환 (있을 경우만)
-        night_market_skins = []
-        bonus_store = store_data.get("BonusStore", {})
-        if bonus_store and "BonusStoreOffers" in bonus_store:
-            for offer in bonus_store["BonusStoreOffers"]:
-                skin_id = offer.get("Offer", {}).get("OfferID", "")
-                skin_info = skin_db.get(skin_id.lower(), {"name": "알 수 없는 스킨", "icon": ""})
-                night_market_skins.append({
-                    "name": skin_info["name"],
-                    "icon": skin_info["icon"],
-                    "discountPercent": offer.get("DiscountPercent", 0)
-                })
-
-        return {
-            "success": True,
-            "puuid": puuid,
-            "daily_store": daily_skins,
-            "night_market": night_market_skins
-        }
-
-    except requests.RequestException:
-        raise HTTPException(status_code=500, detail="라이엇 서버와 통신 중 에러가 발생했습니다.")
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=500, detail=f"라이엇 인증 서버 통신 에러: {str(e)}")
