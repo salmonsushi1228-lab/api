@@ -25,13 +25,20 @@ def check_status():
 
 @app.post("/api/store")
 def get_valorant_store(data: LoginRequest):
+    # 독립된 세션 생성 (쿠키 및 헤더 유지를 위함)
     session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'RiotClient/63.0.9.4909983.4789131 rso-auth (Windows;10;10.0.19045.1.256.64bit)',
+    
+    # 라이엇 클라이언트 최신 User-Agent 설정
+    headers = {
+        'User-Agent': 'RiotClient/84.0.1.1328.3242 rso-auth (Windows;10;10.0.19045.1.256.64bit)',
         'Content-Type': 'application/json',
-        'Accept': 'application/json, text/plain, */*'
-    })
+        'Accept': 'application/json, text/plain, */*',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache'
+    }
+    session.headers.update(headers)
 
+    # 1. 초기 인증 세션 쿠키 발급
     auth_body = {
         "client_id": "play-valorant-web-prod",
         "nonce": "1",
@@ -41,11 +48,10 @@ def get_valorant_store(data: LoginRequest):
     }
 
     try:
-        # 1. Auth 세션 쿠키 초기화
         init_res = session.post("https://auth.riotgames.com/api/v1/authorization", json=auth_body, timeout=10)
         init_res.raise_for_status()
 
-        # 2. 로그인 시도
+        # 2. 로그인 자격 증명(ID/PW) 전송
         login_body = {
             "type": "auth",
             "username": data.username,
@@ -54,11 +60,12 @@ def get_valorant_store(data: LoginRequest):
         }
 
         login_res = session.put("https://auth.riotgames.com/api/v1/authorization", json=login_body, timeout=10)
+        login_res.raise_for_status()
         login_json = login_res.json()
 
-        # 에러 응답 분기 처리
+        # 3. 응답 타입별 세부 처리
         response_type = login_json.get("type")
-        
+
         if response_type == "error":
             err = login_json.get("error")
             if err == "auth_failure":
@@ -66,48 +73,63 @@ def get_valorant_store(data: LoginRequest):
             elif err == "rate_limited":
                 raise HTTPException(status_code=429, detail="시도 횟수가 너무 많습니다. 잠시 후 다시 시도해 주세요.")
             else:
-                raise HTTPException(status_code=400, detail=f"로그인 오류: {err}")
+                raise HTTPException(status_code=400, detail=f"로그인 에러: {err}")
 
         if response_type == "multifactor":
-            raise HTTPException(status_code=400, detail="2단계 인증(MFA)이 설정되어 있어 접속할 수 없습니다. 계정 설정에서 2단계 인증을 해제해 주세요.")
-
-        if response_type == "captcha":
-            raise HTTPException(status_code=400, detail="라이엇 보안 캡차(Captcha)가 동작 중입니다. 웹 브라우저에서 라이엇 공식 사이트에 로그인하여 캡차를 해제 후 시도하세요.")
-
-        # 3. URI 및 토큰 추출
-        uri = login_json.get("response", {}).get("parameters", {}).get("uri", "")
-
-        if not uri:
             raise HTTPException(
                 status_code=400, 
-                detail=f"인증 응답 형식이 올바르지 않습니다. (응답 타입: {response_type})"
+                detail="계정에 2단계 인증(MFA)이 설정되어 있습니다. 라이엇 계정 설정 페이지에서 2단계 인증을 일시 해제해 주세요."
             )
 
+        if response_type == "captcha":
+            raise HTTPException(
+                status_code=400, 
+                detail="라이엇 보안 캡차(Captcha)가 동작 중입니다. PC 브라우저에서 공식 사이트에 로그인하여 캡차를 먼저 해제해 주세요."
+            )
+
+        # type이 'response'이거나 성공 결과가 들어있는지 확인
+        response_data = login_json.get("response", {})
+        parameters = response_data.get("parameters", {})
+        uri = parameters.get("uri", "")
+
+        # 만약 type이 auth에 머물러 있는 경우
+        if response_type == "auth" or not uri:
+            # 실패 원인 파악용
+            if "error" in login_json:
+                raise HTTPException(status_code=400, detail=f"인증 실패: {login_json.get('error')}")
+            raise HTTPException(
+                status_code=400, 
+                detail="라이엇 로그인 차단 또는 비밀번호 오류입니다. 아이디/비밀번호를 재확인해 주세요."
+            )
+
+        # 4. Access Token 파싱
         access_token_match = re.search(r'access_token=([^&]+)', uri)
         if not access_token_match:
-            raise HTTPException(status_code=400, detail="액세스 토큰 파싱에 실패했습니다.")
+            raise HTTPException(status_code=400, detail="액세스 토큰 파싱 실패")
         access_token = access_token_match.group(1)
 
-        # 4. Entitlements Token 발급
+        # 5. Entitlements Token 발급
         ent_res = session.post(
             "https://entitlements.auth.riotgames.com/api/token/v1",
             headers={"Authorization": f"Bearer {access_token}"},
             timeout=10
         )
+        ent_res.raise_for_status()
         entitlements_token = ent_res.json().get("entitlements_token")
 
-        # 5. PUUID 취득
+        # 6. PUUID 취득
         user_res = session.get(
             "https://auth.riotgames.com/userinfo",
             headers={"Authorization": f"Bearer {access_token}"},
             timeout=10
         )
+        user_res.raise_for_status()
         puuid = user_res.json().get("sub")
 
         if not entitlements_token or not puuid:
-            raise HTTPException(status_code=400, detail="사용자 토큰 또는 PUUID 정보 취득 실패")
+            raise HTTPException(status_code=400, detail="유저 토큰 취득 실패")
 
-        # 6. 상점 데이터 수집
+        # 7. 발로란트 상점 데이터 수집
         region_host = "pd.kr" if data.region == "kr" else f"pd.{data.region}"
         store_res = session.get(
             f"https://{region_host}.a.pvp.net/store/v2/storefront/{puuid}",
@@ -117,9 +139,10 @@ def get_valorant_store(data: LoginRequest):
             },
             timeout=10
         )
+        store_res.raise_for_status()
         store_data = store_res.json()
 
-        # 일일상점 파싱
+        # 일일상점 스킨
         daily_item_ids = store_data.get("SkinsPanelLayout", {}).get("SingleItemOffers", [])
         daily_skins = []
 
@@ -135,7 +158,7 @@ def get_valorant_store(data: LoginRequest):
             except Exception:
                 continue
 
-        # 야시장 파싱
+        # 야시장 스킨
         night_skins = []
         bonus_store = store_data.get("BonusStore", {}).get("BonusStoreOffers", [])
         for offer in bonus_store:
