@@ -6,7 +6,6 @@ import asyncio
 
 app = FastAPI()
 
-# CORS 설정
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,14 +18,12 @@ class StoreRequest(BaseModel):
     access_token: str
     region: str = "kr"
 
-# 헬스체크
 @app.get("/")
 @app.get("/store")
 @app.get("/api/store")
 async def check_status():
     return {"status": "ok", "message": "Valorant Store API is running"}
 
-# 단일 스킨 정보 비동기 파싱
 async def fetch_skin_info(client: httpx.AsyncClient, item_id: str, discount: int = 0):
     try:
         url = f"https://valorant-api.com/v1/weapons/skinlevel/{item_id}?language=ko-KR"
@@ -44,7 +41,6 @@ async def fetch_skin_info(client: httpx.AsyncClient, item_id: str, discount: int
         pass
     return None
 
-# 상점 데이터 조회 API
 @app.post("/")
 @app.post("/store")
 @app.post("/api/store")
@@ -53,26 +49,41 @@ async def get_valorant_store(data: StoreRequest):
     if not access_token:
         raise HTTPException(status_code=400, detail="access_token이 필요합니다.")
 
+    # 라이엇 클라이언트 플랫폼 및 버전 명세
     client_platform = "ew0KCSJwbGF0Zm9ybVR5cGUiOiAiUEMiLA0KCSJwbGF0Zm9ybU9TIjogIldpbmRvd3MiLA0KCSJwbGF0Zm9ybU9TVmVyc2lvbiI6ICIxMC4wLjE5MDQ1LjEuMjU2LjY0Yml0IiwNCgkicGxhdGZvcm1DaGlwc2V0IjogIlVua25vd24iDQp9"
+    user_agent = "RiotClient/93.0.1.2132.4019 rso-auth (Windows;10;10.0.19045.1.256.64bit)"
 
     async with httpx.AsyncClient(follow_redirects=True) as client:
         try:
-            # 1. Entitlements Token 발급
+            # 1. 최신 발로란트 게임 클라이언트 버전 동적 파싱 (valorant-api.com 활용)
+            version_res = await client.get("https://valorant-api.com/v1/version")
+            client_version = "release-09.03-shipping-9-2708302"  # 기본 기본값
+            if version_res.status_code == 200:
+                client_version = version_res.json().get("data", {}).get("riotClientVersion", client_version)
+
+            # 2. Entitlements Token 발급
             ent_res = await client.post(
                 "https://entitlements.auth.riotgames.com/api/token/v1",
-                headers={"Authorization": f"Bearer {access_token}"},
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "User-Agent": user_agent,
+                    "Content-Type": "application/json"
+                },
                 json={},
                 timeout=10.0
             )
             if ent_res.status_code != 200:
-                raise HTTPException(status_code=401, detail="유효하지 않거나 만료된 액세스 토큰입니다.")
+                raise HTTPException(status_code=401, detail="유효하지 않거나 만료된 Access Token입니다.")
             
             entitlements_token = ent_res.json().get("entitlements_token")
 
-            # 2. PUUID 취득
+            # 3. PUUID 취득
             user_res = await client.get(
                 "https://auth.riotgames.com/userinfo",
-                headers={"Authorization": f"Bearer {access_token}"},
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "User-Agent": user_agent
+                },
                 timeout=10.0
             )
             if user_res.status_code != 200:
@@ -83,7 +94,7 @@ async def get_valorant_store(data: StoreRequest):
             if not entitlements_token or not puuid:
                 raise HTTPException(status_code=400, detail="토큰 또는 PUUID 파싱 실패")
 
-            # 3. 상점 데이터 조회
+            # 4. 상점 데이터 조회 (X-Riot-ClientVersion 필수 포함)
             region_map = {
                 "kr": "pd.kr",
                 "ap": "pd.ap",
@@ -92,19 +103,29 @@ async def get_valorant_store(data: StoreRequest):
             }
             region_host = region_map.get(data.region.lower(), "pd.kr")
 
+            store_headers = {
+                "Authorization": f"Bearer {access_token}",
+                "X-Riot-Entitlements-JWT": entitlements_token,
+                "X-Riot-ClientPlatform": client_platform,
+                "X-Riot-ClientVersion": client_version,
+                "User-Agent": user_agent
+            }
+
             store_res = await client.get(
                 f"https://{region_host}.a.pvp.net/store/v2/storefront/{puuid}",
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "X-Riot-Entitlements-JWT": entitlements_token,
-                    "X-Riot-ClientPlatform": client_platform
-                },
+                headers=store_headers,
                 timeout=10.0
             )
-            store_res.raise_for_status()
+            
+            if store_res.status_code != 200:
+                raise HTTPException(
+                    status_code=store_res.status_code,
+                    detail=f"상점 조회 실패 ({store_res.status_code}): {store_res.text}"
+                )
+
             store_data = store_res.json()
 
-            # 4. 스킨 정보 병렬 파싱
+            # 5. 스킨 정보 비동기 파싱
             daily_item_ids = store_data.get("SkinsPanelLayout", {}).get("SingleItemOffers", [])
             bonus_store = store_data.get("BonusStore", {}).get("BonusStoreOffers", [])
 
