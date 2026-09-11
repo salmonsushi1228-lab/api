@@ -65,13 +65,13 @@ async def get_valorant_store(data: LoginRequest):
         }
         client.headers.update(headers)
 
-        # 1. Auth 세션 초기화 (POST)
+        # 1. Auth 세션 초기화 (POST) - 발로란트 클라이언트 전용 파라미터 적용
         auth_body = {
-            "client_id": "play-valorant-web-prod",
+            "client_id": "riot-client",
             "nonce": "1",
-            "redirect_uri": "https://playvalorant.com/opt_in",
+            "redirect_uri": "http://localhost/redirect",
             "response_type": "token id_token",
-            "scope": "account openid"
+            "scope": "openid link ban lol_region account"
         }
 
         try:
@@ -126,6 +126,13 @@ async def get_valorant_store(data: LoginRequest):
                 raise HTTPException(
                     status_code=400,
                     detail="보안 캡차(Captcha)가 동작 중입니다. 라이엇 공식 웹사이트에서 직접 로그인하여 캡차를 해제해 주세요."
+                )
+
+            # 응답 유형이 여전히 'auth'인 경우 (비밀번호 불일치 또는 Silent Captcha/보안 요구)
+            if response_type == "auth":
+                raise HTTPException(
+                    status_code=400,
+                    detail="계정 정보가 정확하지 않거나 라이엇 웹사이트를 통한 로그인 확인이 필요합니다. (비밀번호 확인 또는 라이엇 계정 웹사이트에 먼저 로그인해 보세요.)"
                 )
 
             # 3. Access Token URI 파싱
