@@ -54,7 +54,7 @@ async def get_valorant_store(data: StoreRequest):
 
     async with httpx.AsyncClient(follow_redirects=True) as client:
         try:
-            # 1. 라이엇 최신 클라이언트 버전
+            # 1. 라이엇 최신 클라이언트 버전 동적 파싱
             version_res = await client.get("https://valorant-api.com/v1/version")
             client_version = "release-09.03-shipping-9-2708302"
             if version_res.status_code == 200:
@@ -76,7 +76,7 @@ async def get_valorant_store(data: StoreRequest):
             
             entitlements_token = ent_res.json().get("entitlements_token")
 
-            # 3. PUUID 및 계정 지역 취득
+            # 3. PUUID 취득
             user_res = await client.get(
                 "https://auth.riotgames.com/userinfo",
                 headers={
@@ -88,21 +88,42 @@ async def get_valorant_store(data: StoreRequest):
             if user_res.status_code != 200:
                 raise HTTPException(status_code=401, detail="사용자 정보를 가져올 수 없습니다.")
             
-            user_json = user_res.json()
-            puuid = user_json.get("sub")
+            puuid = user_res.json().get("sub")
 
             if not puuid:
                 raise HTTPException(status_code=400, detail="사용자 PUUID 추출 실패")
 
-            # 4. 상점 요청 (지역 자동 대조 및 다중 요청 시도)
-            regions_to_try = [data.region.lower(), "kr", "ap", "na", "eu"]
-            # 중복 제거 및 리스트 유지
+            # 4. 계정의 실제 서버 지역(PAS Shard) 조회 시도
+            detected_shard = None
+            try:
+                pas_res = await client.put(
+                    "https://riot-geo.pas.games.riotgames.com/pas/v1/product/valorant",
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "Content-Type": "application/json"
+                    },
+                    json={"id_token": access_token},
+                    timeout=5.0
+                )
+                if pas_res.status_code == 200:
+                    detected_shard = pas_res.json().get("affiliateities", {}).get("valorant", {}).get("shard")
+            except Exception:
+                pass
+
+            # 탐색할 지역 목록 정리
+            regions_to_try = []
+            if detected_shard:
+                regions_to_try.append(detected_shard.lower())
+            regions_to_try.extend([data.region.lower(), "kr", "ap", "na", "eu", "latam", "br"])
+            
+            # 중복 제거 (순서 유지)
             regions_to_try = list(dict.fromkeys(regions_to_try))
 
             store_data = None
             last_status = 404
             last_text = ""
 
+            # 5. 각 서버 엔드포인트 순차 호출
             for reg in regions_to_try:
                 region_host = f"pd.{reg}"
                 store_headers = {
@@ -129,10 +150,10 @@ async def get_valorant_store(data: StoreRequest):
             if not store_data:
                 raise HTTPException(
                     status_code=last_status,
-                    detail=f"상점 조회 실패 ({last_status}): 해당 계정의 발로란트 데이터가 없거나 서버 지역이 올바르지 않습니다."
+                    detail="발로란트 계정 정보를 찾을 수 없습니다. 해당 라이엇 계정으로 발로란트 게임에 최소 1회 접속한 적이 있는지 확인해 주세요."
                 )
 
-            # 5. 스킨 정보 비동기 파싱
+            # 6. 스킨 정보 비동기 파싱
             daily_item_ids = store_data.get("SkinsPanelLayout", {}).get("SingleItemOffers", [])
             bonus_store = store_data.get("BonusStore", {}).get("BonusStoreOffers", [])
 
