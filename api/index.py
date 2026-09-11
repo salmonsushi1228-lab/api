@@ -8,7 +8,7 @@ import re
 
 app = FastAPI()
 
-# CORS 설정
+# CORS 설정: 프론트엔드 통신 허용
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,13 +22,14 @@ class LoginRequest(BaseModel):
     password: str
     region: str = "kr"
 
-# 헬스체크 및 백엔드 상태 확인
-@app.get("/api/store")
+# 헬스체크 및 백엔드 상태 확인 (Vercel Rewrites 대응: /, /store, /api/store 모두 등록)
+@app.get("/")
 @app.get("/store")
+@app.get("/api/store")
 async def check_status():
     return {"status": "ok", "message": "Valorant Store API is running"}
 
-# 단일 스킨 정보 비동기 파싱 함수
+# 단일 스킨 정보 비동기 파싱 함수 (병렬 처리용)
 async def fetch_skin_info(client: httpx.AsyncClient, item_id: str, discount: int = 0):
     try:
         url = f"https://valorant-api.com/v1/weapons/skinlevel/{item_id}?language=ko-KR"
@@ -46,8 +47,10 @@ async def fetch_skin_info(client: httpx.AsyncClient, item_id: str, discount: int
         pass
     return None
 
-@app.post("/api/store")
+# 상점 데이터 조회 POST 엔드포인트
+@app.post("/")
 @app.post("/store")
+@app.post("/api/store")
 async def get_valorant_store(data: LoginRequest):
     # httpx AsyncClient를 통한 비동기 세션 구성 (쿠키 자동 유지)
     async with httpx.AsyncClient(follow_redirects=True) as client:
@@ -180,20 +183,18 @@ async def get_valorant_store(data: LoginRequest):
             store_res.raise_for_status()
             store_data = store_res.json()
 
-            # 7. 일일상점 & 야시장 스킨 비동기 병렬 파싱 (속도 극대화)
+            # 7. 일일상점 & 야시장 스킨 비동기 병렬 파싱
             daily_item_ids = store_data.get("SkinsPanelLayout", {}).get("SingleItemOffers", [])
             bonus_store = store_data.get("BonusStore", {}).get("BonusStoreOffers", [])
 
-            # 일일상점 태스크 등록
+            # 태스크 생성
             daily_tasks = [fetch_skin_info(client, item_id) for item_id in daily_item_ids]
-            
-            # 야시장 태스크 등록
             night_tasks = [
                 fetch_skin_info(
-                    client, 
-                    offer.get("Offer", {}).get("OfferID"), 
+                    client,
+                    offer.get("Offer", {}).get("OfferID"),
                     offer.get("DiscountPercent", 0)
-                ) 
+                )
                 for offer in bonus_store
             ]
 
@@ -201,7 +202,7 @@ async def get_valorant_store(data: LoginRequest):
             daily_results = await asyncio.gather(*daily_tasks)
             night_results = await asyncio.gather(*night_tasks)
 
-            # None 값 제거
+            # None 값 제외
             daily_skins = [s for s in daily_results if s is not None]
             night_skins = [s for s in night_results if s is not None]
 
@@ -215,4 +216,3 @@ async def get_valorant_store(data: LoginRequest):
             raise he
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"서버 처리 오류: {str(e)}")
-        
