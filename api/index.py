@@ -49,15 +49,14 @@ async def get_valorant_store(data: StoreRequest):
     if not access_token:
         raise HTTPException(status_code=400, detail="access_token이 필요합니다.")
 
-    # 라이엇 클라이언트 플랫폼 및 버전 명세
     client_platform = "ew0KCSJwbGF0Zm9ybVR5cGUiOiAiUEMiLA0KCSJwbGF0Zm9ybU9TIjogIldpbmRvd3MiLA0KCSJwbGF0Zm9ybU9TVmVyc2lvbiI6ICIxMC4wLjE5MDQ1LjEuMjU2LjY0Yml0IiwNCgkicGxhdGZvcm1DaGlwc2V0IjogIlVua25vd24iDQp9"
     user_agent = "RiotClient/93.0.1.2132.4019 rso-auth (Windows;10;10.0.19045.1.256.64bit)"
 
     async with httpx.AsyncClient(follow_redirects=True) as client:
         try:
-            # 1. 최신 발로란트 게임 클라이언트 버전 동적 파싱 (valorant-api.com 활용)
+            # 1. 라이엇 최신 클라이언트 버전
             version_res = await client.get("https://valorant-api.com/v1/version")
-            client_version = "release-09.03-shipping-9-2708302"  # 기본 기본값
+            client_version = "release-09.03-shipping-9-2708302"
             if version_res.status_code == 200:
                 client_version = version_res.json().get("data", {}).get("riotClientVersion", client_version)
 
@@ -77,7 +76,7 @@ async def get_valorant_store(data: StoreRequest):
             
             entitlements_token = ent_res.json().get("entitlements_token")
 
-            # 3. PUUID 취득
+            # 3. PUUID 및 계정 지역 취득
             user_res = await client.get(
                 "https://auth.riotgames.com/userinfo",
                 headers={
@@ -89,41 +88,49 @@ async def get_valorant_store(data: StoreRequest):
             if user_res.status_code != 200:
                 raise HTTPException(status_code=401, detail="사용자 정보를 가져올 수 없습니다.")
             
-            puuid = user_res.json().get("sub")
+            user_json = user_res.json()
+            puuid = user_json.get("sub")
 
-            if not entitlements_token or not puuid:
-                raise HTTPException(status_code=400, detail="토큰 또는 PUUID 파싱 실패")
+            if not puuid:
+                raise HTTPException(status_code=400, detail="사용자 PUUID 추출 실패")
 
-            # 4. 상점 데이터 조회 (X-Riot-ClientVersion 필수 포함)
-            region_map = {
-                "kr": "pd.kr",
-                "ap": "pd.ap",
-                "na": "pd.na",
-                "eu": "pd.eu"
-            }
-            region_host = region_map.get(data.region.lower(), "pd.kr")
+            # 4. 상점 요청 (지역 자동 대조 및 다중 요청 시도)
+            regions_to_try = [data.region.lower(), "kr", "ap", "na", "eu"]
+            # 중복 제거 및 리스트 유지
+            regions_to_try = list(dict.fromkeys(regions_to_try))
 
-            store_headers = {
-                "Authorization": f"Bearer {access_token}",
-                "X-Riot-Entitlements-JWT": entitlements_token,
-                "X-Riot-ClientPlatform": client_platform,
-                "X-Riot-ClientVersion": client_version,
-                "User-Agent": user_agent
-            }
+            store_data = None
+            last_status = 404
+            last_text = ""
 
-            store_res = await client.get(
-                f"https://{region_host}.a.pvp.net/store/v2/storefront/{puuid}",
-                headers=store_headers,
-                timeout=10.0
-            )
-            
-            if store_res.status_code != 200:
-                raise HTTPException(
-                    status_code=store_res.status_code,
-                    detail=f"상점 조회 실패 ({store_res.status_code}): {store_res.text}"
+            for reg in regions_to_try:
+                region_host = f"pd.{reg}"
+                store_headers = {
+                    "Authorization": f"Bearer {access_token}",
+                    "X-Riot-Entitlements-JWT": entitlements_token,
+                    "X-Riot-ClientPlatform": client_platform,
+                    "X-Riot-ClientVersion": client_version,
+                    "User-Agent": user_agent
+                }
+
+                store_res = await client.get(
+                    f"https://{region_host}.a.pvp.net/store/v2/storefront/{puuid}",
+                    headers=store_headers,
+                    timeout=10.0
                 )
 
-            store_data = store_res.json()
+                if store_res.status_code == 200:
+                    store_data = store_res.json()
+                    break
+                else:
+                    last_status = store_res.status_code
+                    last_text = store_res.text
+
+            if not store_data:
+                raise HTTPException(
+                    status_code=last_status,
+                    detail=f"상점 조회 실패 ({last_status}): 해당 계정의 발로란트 데이터가 없거나 서버 지역이 올바르지 않습니다."
+                )
 
             # 5. 스킨 정보 비동기 파싱
             daily_item_ids = store_data.get("SkinsPanelLayout", {}).get("SingleItemOffers", [])
