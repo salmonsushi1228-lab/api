@@ -3,8 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
 import asyncio
-import json
-import re
 
 app = FastAPI()
 
@@ -17,12 +15,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-class LoginRequest(BaseModel):
-    username: str
-    password: str
+class StoreRequest(BaseModel):
+    access_token: str
     region: str = "kr"
 
-# 헬스체크 (Vercel Rewrites 대응: /, /store, /api/store)
+# 헬스체크
 @app.get("/")
 @app.get("/store")
 @app.get("/api/store")
@@ -47,134 +44,46 @@ async def fetch_skin_info(client: httpx.AsyncClient, item_id: str, discount: int
         pass
     return None
 
+# 상점 데이터 조회 API
 @app.post("/")
 @app.post("/store")
 @app.post("/api/store")
-async def get_valorant_store(data: LoginRequest):
-    # 최신 Riot Client 헤더 및 Client-Platform 명세
+async def get_valorant_store(data: StoreRequest):
+    access_token = data.access_token.strip()
+    if not access_token:
+        raise HTTPException(status_code=400, detail="access_token이 필요합니다.")
+
     client_platform = "ew0KCSJwbGF0Zm9ybVR5cGUiOiAiUEMiLA0KCSJwbGF0Zm9ybU9TIjogIldpbmRvd3MiLA0KCSJwbGF0Zm9ybU9TVmVyc2lvbiI6ICIxMC4wLjE5MDQ1LjEuMjU2LjY0Yml0IiwNCgkicGxhdGZvcm1DaGlwc2V0IjogIlVua25vd24iDQp9"
-    user_agent = "RiotClient/93.0.1.2132.4019 rso-auth (Windows;10;10.0.19045.1.256.64bit)"
 
-    async with httpx.AsyncClient(follow_redirects=True, cookies=httpx.Cookies()) as client:
-        headers = {
-            'User-Agent': user_agent,
-            'Content-Type': 'application/json',
-            'Accept': 'application/json, text/plain, */*',
-            'X-Riot-ClientPlatform': client_platform,
-            'X-Riot-ClientVersion': 'release-09.03-shipping-9-2708302'
-        }
-        client.headers.update(headers)
-
-        # 1. Auth 세션 초기화 (POST) - 발로란트 클라이언트 전용 파라미터 적용
-        auth_body = {
-            "client_id": "riot-client",
-            "nonce": "1",
-            "redirect_uri": "http://localhost/redirect",
-            "response_type": "token id_token",
-            "scope": "openid link ban lol_region account"
-        }
-
+    async with httpx.AsyncClient(follow_redirects=True) as client:
         try:
-            init_res = await client.post(
-                "https://auth.riotgames.com/api/v1/authorization",
-                json=auth_body,
-                timeout=10.0
-            )
-            init_res.raise_for_status()
-
-            # 2. 자격 증명 전송 (PUT)
-            login_body = {
-                "type": "auth",
-                "username": data.username.strip(),
-                "password": data.password,
-                "remember": True
-            }
-
-            login_res = await client.put(
-                "https://auth.riotgames.com/api/v1/authorization",
-                json=login_body,
-                timeout=10.0
-            )
-            login_res.raise_for_status()
-            login_json = login_res.json()
-
-            response_type = login_json.get("type")
-
-            # 오류 및 인증 예외 분기
-            if response_type == "error":
-                err = login_json.get("error")
-                if err == "auth_failure":
-                    raise HTTPException(
-                        status_code=400,
-                        detail="아이디 또는 비밀번호가 올바르지 않습니다. (Riot ID 태그가 아닌 '로그인용 계정명'을 입력했는지 확인해 주세요.)"
-                    )
-                elif err == "rate_limited":
-                    raise HTTPException(
-                        status_code=429,
-                        detail="로그인 시도 횟수가 너무 많습니다. 잠시 후 다시 시도해 주세요."
-                    )
-                else:
-                    raise HTTPException(status_code=400, detail=f"인증 실패: {err}")
-
-            if response_type == "multifactor":
-                raise HTTPException(
-                    status_code=400,
-                    detail="계정에 2단계 인증(MFA)이 설정되어 있습니다. 라이엇 계정 관리에서 2단계 인증을 해제해 주세요."
-                )
-
-            if response_type == "captcha":
-                raise HTTPException(
-                    status_code=400,
-                    detail="보안 캡차(Captcha)가 동작 중입니다. 라이엇 공식 웹사이트에서 직접 로그인하여 캡차를 해제해 주세요."
-                )
-
-            # 응답 유형이 여전히 'auth'인 경우 (비밀번호 불일치 또는 Silent Captcha/보안 요구)
-            if response_type == "auth":
-                raise HTTPException(
-                    status_code=400,
-                    detail="계정 정보가 정확하지 않거나 라이엇 웹사이트를 통한 로그인 확인이 필요합니다. (비밀번호 확인 또는 라이엇 계정 웹사이트에 먼저 로그인해 보세요.)"
-                )
-
-            # 3. Access Token URI 파싱
-            response_data = login_json.get("response", {})
-            parameters = response_data.get("parameters", {})
-            uri = parameters.get("uri", "")
-
-            if not uri:
-                # 응답 구조 디버깅용 메시지
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"인증 URI를 취득하지 못했습니다. (라이엇 응답 유형: {response_type})"
-                )
-
-            access_token_match = re.search(r'access_token=([^&]+)', uri)
-            if not access_token_match:
-                raise HTTPException(status_code=400, detail="액세스 토큰 파싱에 실패했습니다.")
-            access_token = access_token_match.group(1)
-
-            # 4. Entitlements Token 발급
+            # 1. Entitlements Token 발급
             ent_res = await client.post(
                 "https://entitlements.auth.riotgames.com/api/token/v1",
                 headers={"Authorization": f"Bearer {access_token}"},
                 json={},
                 timeout=10.0
             )
-            ent_res.raise_for_status()
+            if ent_res.status_code != 200:
+                raise HTTPException(status_code=401, detail="유효하지 않거나 만료된 액세스 토큰입니다.")
+            
             entitlements_token = ent_res.json().get("entitlements_token")
 
-            # 5. PUUID 취득
+            # 2. PUUID 취득
             user_res = await client.get(
                 "https://auth.riotgames.com/userinfo",
                 headers={"Authorization": f"Bearer {access_token}"},
                 timeout=10.0
             )
-            user_res.raise_for_status()
+            if user_res.status_code != 200:
+                raise HTTPException(status_code=401, detail="사용자 정보를 가져올 수 없습니다.")
+            
             puuid = user_res.json().get("sub")
 
             if not entitlements_token or not puuid:
-                raise HTTPException(status_code=400, detail="유저 토큰 또는 PUUID 취득 실패")
+                raise HTTPException(status_code=400, detail="토큰 또는 PUUID 파싱 실패")
 
-            # 6. 상점 데이터 조회
+            # 3. 상점 데이터 조회
             region_map = {
                 "kr": "pd.kr",
                 "ap": "pd.ap",
@@ -195,7 +104,7 @@ async def get_valorant_store(data: LoginRequest):
             store_res.raise_for_status()
             store_data = store_res.json()
 
-            # 7. 일일상점 & 야시장 스킨 비동기 병렬 파싱
+            # 4. 스킨 정보 병렬 파싱
             daily_item_ids = store_data.get("SkinsPanelLayout", {}).get("SingleItemOffers", [])
             bonus_store = store_data.get("BonusStore", {}).get("BonusStoreOffers", [])
 
