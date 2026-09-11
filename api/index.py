@@ -27,7 +27,7 @@ async def check_status():
 async def fetch_skin_info(client: httpx.AsyncClient, item_id: str, discount: int = 0):
     try:
         url = f"https://valorant-api.com/v1/weapons/skinlevel/{item_id}?language=ko-KR"
-        res = await client.get(url, timeout=5.0)
+        res = await client.get(url)
         if res.status_code == 200:
             data_obj = res.json().get("data", {})
             skin_data = {
@@ -52,13 +52,20 @@ async def get_valorant_store(data: StoreRequest):
     client_platform = "ew0KCSJwbGF0Zm9ybVR5cGUiOiAiUEMiLA0KCSJwbGF0Zm9ybU9TIjogIldpbmRvd3MiLA0KCSJwbGF0Zm9ybU9TVmVyc2lvbiI6ICIxMC4wLjE5MDQ1LjEuMjU2LjY0Yml0IiwNCgkicGxhdGZvcm1DaGlwc2V0IjogIlVua25vd24iDQp9"
     user_agent = "RiotClient/93.0.1.2132.4019 rso-auth (Windows;10;10.0.19045.1.256.64bit)"
 
-    async with httpx.AsyncClient(follow_redirects=True) as client:
+    # 타임아웃 및 컨넥션 풀 설정 강화
+    timeout = httpx.Timeout(10.0, connect=5.0)
+    limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
+
+    async with httpx.AsyncClient(timeout=timeout, limits=limits, follow_redirects=True) as client:
         try:
-            # 1. 라이엇 최신 클라이언트 버전 동적 파싱
-            version_res = await client.get("https://valorant-api.com/v1/version")
+            # 1. 최신 발로란트 클라이언트 버전 동적 파싱
             client_version = "release-09.03-shipping-9-2708302"
-            if version_res.status_code == 200:
-                client_version = version_res.json().get("data", {}).get("riotClientVersion", client_version)
+            try:
+                version_res = await client.get("https://valorant-api.com/v1/version")
+                if version_res.status_code == 200:
+                    client_version = version_res.json().get("data", {}).get("riotClientVersion", client_version)
+            except Exception:
+                pass
 
             # 2. Entitlements Token 발급
             ent_res = await client.post(
@@ -68,8 +75,7 @@ async def get_valorant_store(data: StoreRequest):
                     "User-Agent": user_agent,
                     "Content-Type": "application/json"
                 },
-                json={},
-                timeout=10.0
+                json={}
             )
             if ent_res.status_code != 200:
                 raise HTTPException(status_code=401, detail="유효하지 않거나 만료된 Access Token입니다.")
@@ -82,18 +88,16 @@ async def get_valorant_store(data: StoreRequest):
                 headers={
                     "Authorization": f"Bearer {access_token}",
                     "User-Agent": user_agent
-                },
-                timeout=10.0
+                }
             )
             if user_res.status_code != 200:
                 raise HTTPException(status_code=401, detail="사용자 정보를 가져올 수 없습니다.")
             
             puuid = user_res.json().get("sub")
-
             if not puuid:
                 raise HTTPException(status_code=400, detail="사용자 PUUID 추출 실패")
 
-            # 4. 계정의 실제 서버 지역(PAS Shard) 조회 시도
+            # 4. 계정 서버 지역(PAS Shard) 조회
             detected_shard = None
             try:
                 pas_res = await client.put(
@@ -102,8 +106,7 @@ async def get_valorant_store(data: StoreRequest):
                         "Authorization": f"Bearer {access_token}",
                         "Content-Type": "application/json"
                     },
-                    json={"id_token": access_token},
-                    timeout=5.0
+                    json={"id_token": access_token}
                 )
                 if pas_res.status_code == 200:
                     detected_shard = pas_res.json().get("affiliateities", {}).get("valorant", {}).get("shard")
@@ -115,15 +118,12 @@ async def get_valorant_store(data: StoreRequest):
             if detected_shard:
                 regions_to_try.append(detected_shard.lower())
             regions_to_try.extend([data.region.lower(), "kr", "ap", "na", "eu", "latam", "br"])
-            
-            # 중복 제거 (순서 유지)
             regions_to_try = list(dict.fromkeys(regions_to_try))
 
             store_data = None
             last_status = 404
-            last_text = ""
 
-            # 5. 각 서버 엔드포인트 순차 호출
+            # 5. 상점 엔드포인트 순차 조회
             for reg in regions_to_try:
                 region_host = f"pd.{reg}"
                 store_headers = {
@@ -136,8 +136,7 @@ async def get_valorant_store(data: StoreRequest):
 
                 store_res = await client.get(
                     f"https://{region_host}.a.pvp.net/store/v2/storefront/{puuid}",
-                    headers=store_headers,
-                    timeout=10.0
+                    headers=store_headers
                 )
 
                 if store_res.status_code == 200:
@@ -145,12 +144,11 @@ async def get_valorant_store(data: StoreRequest):
                     break
                 else:
                     last_status = store_res.status_code
-                    last_text = store_res.text
 
             if not store_data:
                 raise HTTPException(
                     status_code=last_status,
-                    detail="발로란트 계정 정보를 찾을 수 없습니다. 해당 라이엇 계정으로 발로란트 게임에 최소 1회 접속한 적이 있는지 확인해 주세요."
+                    detail="발로란트 계정 정보를 찾을 수 없습니다. 해당 계정으로 발로란트 게임에 최소 1회 접속한 적이 있는지 확인해 주세요."
                 )
 
             # 6. 스킨 정보 비동기 파싱
@@ -182,4 +180,4 @@ async def get_valorant_store(data: StoreRequest):
         except HTTPException as he:
             raise he
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"서버 처리 오류: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"상점 요청 처리 중 오류가 발생했습니다: {str(e)}")
