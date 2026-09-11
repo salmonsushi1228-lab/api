@@ -6,7 +6,6 @@ import re
 
 app = FastAPI()
 
-# CORS 설정 (패드/브라우저에서 자유롭게 호출 가능)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -14,6 +13,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 👈 테스트용 (브라우저에서 직접 접속했을 때 404가 아닌 메시지가 떠야 정상 작동함)
+@app.get("/api/store")
+def check_status():
+    return {"status": "ok", "message": "Valorant Store API is running"}
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+    region: str = "kr"
+
+# ... (기존 @app.post("/api/store") 코드 그대로 유지)
 
 class LoginRequest(BaseModel):
     username: str
