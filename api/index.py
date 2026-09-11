@@ -4,10 +4,9 @@ from pydantic import BaseModel
 import requests
 import re
 
-# ⚠️ Vercel이 인지할 수 있도록 반드시 최상단(Top-level)에 'app'이라는 이름으로 선언해야 합니다.
+# ⚠️ [필수] 들여쓰기(공백) 없이 가장 바깥쪽에 선언되어야 합니다!
 app = FastAPI()
 
-# CORS 설정
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,10 +20,12 @@ class LoginRequest(BaseModel):
     password: str
     region: str = "kr"
 
-# 연결 상태 점검용 GET 엔드포인트
+# 테스트용 GET
 @app.get("/api/store")
 def check_status():
     return {"status": "ok", "message": "Valorant Store API is running"}
+
+# ... (이하 POST 로직)
 
 # 라이엇 상점 조회 POST 엔드포인트
 @app.post("/api/store")
